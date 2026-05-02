@@ -10,6 +10,7 @@ import { useCurrentSeller } from "$app/components/CurrentSeller";
 import CustomDomain from "$app/components/CustomDomain";
 import { Layout, useProductUrl } from "$app/components/ProductEdit/Layout";
 import { ProductPreview } from "$app/components/ProductEdit/ProductPreview";
+import { AiReadinessScore } from "$app/components/ProductEdit/ProductTab/AiReadinessScore";
 import { AttributesEditor } from "$app/components/ProductEdit/ProductTab/AttributesEditor";
 import { AvailabilityEditor } from "$app/components/ProductEdit/ProductTab/AvailabilityEditor";
 import { BundleConversionNotice } from "$app/components/ProductEdit/ProductTab/BundleConversionNotice";
@@ -102,6 +103,7 @@ export const ProductTab = () => {
               </Alert>
             ) : null}
             <BundleConversionNotice />
+            <AiReadinessScore />
             <Fieldset>
               <Label htmlFor={`${uid}-name`}>{isCoffee ? "Header" : "Name"}</Label>
               <Input
