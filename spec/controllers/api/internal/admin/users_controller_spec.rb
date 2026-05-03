@@ -466,6 +466,29 @@ describe Api::Internal::Admin::UsersController do
       expect(user.comments.last.author_id).to eq(admin_user.id)
     end
 
+    it "creates comments and audit rows attributed to a per-actor token" do
+      actor = create(:admin_user)
+      plaintext_token = AdminApiToken.mint!(actor_user_id: actor.id)
+      admin_api_token = AdminApiToken.find_by!(actor_user: actor, token_hash: AdminApiToken.hash_token(plaintext_token))
+      request.headers["Authorization"] = "Bearer #{plaintext_token}"
+
+      post :create_comment, params: { email: user.email, content: "Actor note", idempotency_key: idempotency_key }
+
+      expect(response).to have_http_status(:ok)
+      expect(user.comments.last).to have_attributes(
+        author_id: actor.id,
+        content: "Actor note"
+      )
+      expect(AdminApiAuditLog.last).to have_attributes(
+        action: "users.create_comment",
+        actor_user_id: actor.id,
+        admin_api_token_id: admin_api_token.id,
+        target_type: "User",
+        target_id: user.id,
+        response_status: 200
+      )
+    end
+
     it "returns the existing comment when called twice with the same key and matching content" do
       post :create_comment, params: { email: user.email, content: "Note", idempotency_key: idempotency_key }
       first_id = response.parsed_body["comment"]["id"]
@@ -500,8 +523,6 @@ describe Api::Internal::Admin::UsersController do
     let(:user) { create(:user, user_risk_state: "suspended_for_fraud", email: "seller@example.com") }
 
     include_examples "admin api authorization required", :post, :mark_compliant
-
-    before { stub_const("GUMROAD_ADMIN_ID", admin_user.id) }
 
     it "returns 400 when email is missing" do
       post :mark_compliant
@@ -593,8 +614,6 @@ describe Api::Internal::Admin::UsersController do
     let(:user) { create(:compliant_user, email: "seller@example.com") }
 
     include_examples "admin api authorization required", :post, :suspend_for_fraud
-
-    before { stub_const("GUMROAD_ADMIN_ID", admin_user.id) }
 
     it "returns 400 when email is missing" do
       post :suspend_for_fraud

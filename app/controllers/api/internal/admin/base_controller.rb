@@ -1,22 +1,158 @@
 # frozen_string_literal: true
 
 class Api::Internal::Admin::BaseController < Api::Internal::BaseController
+  include AdminActor
+  include AfterCommitEverywhere
+
+  ADMIN_AUDIT_REDACTED_PARAM_PATTERN = /password|secret|token|two_factor|otp|webhook_url|license_key|email/i
+  ADMIN_AUDIT_ACTION_REDACTED_PARAM_KEYS = {
+    "purchases.reassign" => %w[from to]
+  }.freeze
+  ADMIN_AUDIT_ACTIONS_ALLOWING_NULL_TARGET = %w[
+    purchases.reassign
+    purchases.resend_all_receipts
+  ].freeze
+
   skip_before_action :verify_authenticity_token
   before_action :verify_authorization_header!
   before_action :authorize_admin_token!
 
   private
     def authorize_admin_token!
-      token = request.authorization.split(" ").last
-      expected_token = GlobalConfig.get("INTERNAL_ADMIN_API_TOKEN").to_s
+      token = bearer_token
+      admin_api_token = AdminApiToken.authenticate(token)
+      return render_invalid_authorization unless admin_api_token
 
-      unless expected_token.present? && token.present? && ActiveSupport::SecurityUtils.secure_compare(token, expected_token)
-        render json: { success: false, message: "authorization is invalid" }, status: :unauthorized
-      end
+      set_current_admin_actor!(admin_api_token.actor_user, admin_token: admin_api_token)
+      admin_api_token.record_used!
+    end
+
+    def require_per_actor_token!
+      return if Current.admin_token.present? && !Current.admin_token.legacy_admin_token?
+
+      render json: { success: false, message: "per-actor admin token is required" }, status: :unauthorized
     end
 
     def verify_authorization_header!
       render json: { success: false, message: "unauthenticated" }, status: :unauthorized if request.authorization.nil?
+    end
+
+    def bearer_token
+      authorization_header = request.authorization.to_s
+      authorization_header.match(/\ABearer (.+)\z/)&.[](1)
+    end
+
+    def render_invalid_authorization
+      render json: { success: false, message: "authorization is invalid" }, status: :unauthorized
+    end
+
+    def serialize_admin_actor(admin_actor)
+      {
+        external_id: admin_actor.external_id,
+        name: admin_actor.name.presence || admin_actor.email,
+        email: admin_actor.email
+      }
+    end
+
+    def serialize_admin_token(admin_api_token)
+      {
+        external_id: admin_api_token.external_id,
+        expires_at: admin_api_token.expires_at&.as_json
+      }
+    end
+
+    def current_admin_actor_id
+      Current.admin_actor.id
+    end
+
+    def record_admin_write(action:, target: nil)
+      validate_admin_audit_target!(action:, target:)
+
+      error = nil
+      begin
+        yield
+      rescue => e
+        error = e
+        raise
+      ensure
+        write_admin_audit_log(action:, target:, error:)
+      end
+    end
+
+    def validate_admin_audit_target!(action:, target:)
+      return if action.present? && (target.present? || ADMIN_AUDIT_ACTIONS_ALLOWING_NULL_TARGET.include?(action))
+
+      raise ArgumentError, "admin write audit target is required for #{action.presence || "unknown action"}"
+    end
+
+    def write_admin_audit_log(action:, target:, error:)
+      return if Current.admin_actor.blank? || Current.admin_token.blank?
+
+      attributes = {
+        actor_user_id: Current.admin_actor.id,
+        admin_api_token_id: Current.admin_token.id,
+        action:,
+        target_type: admin_audit_target_type(target),
+        target_id: target&.id,
+        target_external_id: admin_audit_target_external_id(target),
+        route: request.path,
+        http_method: request.request_method,
+        params_snapshot: admin_audit_params_snapshot(action),
+        request_id: request.request_id,
+        response_status: error.present? ? Rack::Utils.status_code(:internal_server_error) : response.status,
+        error_class: error&.class&.name,
+        created_at: Time.current
+      }
+
+      after_commit do
+        AdminApiAuditLog.create!(attributes)
+      rescue => e
+        handle_admin_audit_log_failure(e, attributes)
+      end
+    end
+
+    def admin_audit_target_type(target)
+      target&.class&.base_class&.name
+    end
+
+    def admin_audit_target_external_id(target)
+      return if target.blank?
+      return target.external_id.to_s if target.respond_to?(:external_id) && target.external_id.present?
+
+      target.external_id_numeric.to_s if target.respond_to?(:external_id_numeric) && target.external_id_numeric.present?
+    end
+
+    def handle_admin_audit_log_failure(error, attributes)
+      Rails.logger.error("Failed to record admin audit log for #{attributes[:action]}: #{error.class.name}: #{error.message}")
+      ErrorNotifier.notify(error) do |report|
+        report.add_metadata(:admin_audit_log, attributes.except(:params_snapshot))
+      end
+    end
+
+    def admin_audit_params_snapshot(action)
+      redacted_admin_audit_value(params.to_unsafe_h.except("controller", "action", "format"), action:)
+    end
+
+    def redacted_admin_audit_value(value, key: nil, action:)
+      return "[REDACTED]" if admin_audit_redacted_param_key?(key, action:)
+
+      case value
+      when ActionController::Parameters
+        redacted_admin_audit_value(value.to_unsafe_h, key:, action:)
+      when Hash
+        value.to_h.each_with_object({}) do |(nested_key, nested_value), redacted|
+          redacted[nested_key] = redacted_admin_audit_value(nested_value, key: nested_key, action:)
+        end
+      when Array
+        value.map { redacted_admin_audit_value(_1, key:, action:) }
+      else
+        value
+      end
+    end
+
+    def admin_audit_redacted_param_key?(key, action:)
+      key.to_s.match?(ADMIN_AUDIT_REDACTED_PARAM_PATTERN) ||
+        ADMIN_AUDIT_ACTION_REDACTED_PARAM_KEYS.fetch(action, []).include?(key.to_s)
     end
 
     def serialize_purchase(purchase)
